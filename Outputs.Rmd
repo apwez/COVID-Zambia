@@ -1,0 +1,425 @@
+---
+knit: (function(inputFile, encoding) { 
+          rmarkdown::render(inputFile,
+                        encoding=encoding, 
+                output_file='Outputs.html') })
+---
+
+#### Planning for COVID-19 in Zambia
+
+Prepared by JHU. 
+Updated `r Sys.Date()`
+
+```{r setup, include=FALSE, eval=TRUE}
+options(tinytex.verbose = TRUE, scipen = 999)
+knitr::opts_chunk$set(echo = FALSE, cache = FALSE, warning=FALSE, message=FALSE, fig.align="center")
+```
+
+**This report is based on mathematical models of transmission, and is not a forecast of the epidemic trajectory. Rather, these estimates should be used to help guide decision making regarding prevention, mitigation and preparedness strategies. Results are specific to Zambia. This is a living document and can be updated to reflect changes in our understanding of the SARS-CoV-2 virus and public health interventions in the region.** 
+
+**Purpose**
+<br>
+The purpose of this report is to compare the health impact and surge capacity needs for the 2020 COVID-19 epidemic in Baltimore City. We use a stochastic age-structured Susceptible Exposed Infected Recovered (SEIR) model to predict the number of incident cases within age groups, and among healthcare workers and the homeless population. We then use our best understanding of the natural history of SARS-CoV2 to estimate the number of hospitalizations, ICU admissions, ventilators required, and deaths in Baltimore City. 
+
+We compare three intervention strategies under two transmission scenarios for model simulations from February 1, 2020 through November 30, 2020. The transmission scenarios are:
+
+- Low transmission scenario where $R_0$ is assumed to be between 1.5-2.5.
+- High transmission scenario where $R_0$ is assumed to be between 2.5-3.5.
+
+Within each scenario we considered the following three intervention strategies:
+
+(A) Uncontrolled worst-case scenario (Uncontrolled): In this strategy the epidemic is allowed to spread uncontrolled with no interventions or indivudual behavior change.
+(B) Mildly restrictive social distancing followed by uncontrolled spread (Mild): This strategy has relaxed social distancing from March 20 through May 15 (30-40% reduction in $R_0$) and then returns to uncontrolled transmission.
+(C) Moderately restrictive social distancing followed by targeted testing and isolation (Moderate + Testing): This strategy has moderately restrictive social distancing similar to that in US cities during the 1918 influenza pandemic from March 20 through May 15 (44-65% reduction in $R_0$). From May 16 through November 30, there is a targeted test and isolate strategy similar to that implemented in South Korea (48-76% reduction in $R_0$).
+
+**Assumptions**
+<br>
+Given the limited amount of information on some of the key epidemiologic features of COVID-19, we have used commonly accepted estimates in the literature thus far and believe these are appropriate for planning purposes. These assumptions are subject to change as new information becomes available. Specific details regarding the methods and assumptions used in this report are provided in the technical appendix.
+
+
+```{r data, include=FALSE, eval=TRUE, echo=FALSE}
+
+require(socialmixr)
+require(xlsx)
+require(magrittr)
+require(stringr)
+require(reshape2)
+require(dplyr)
+require(ggplot2) 
+require(tidyr)
+require(xtable)
+require(cowplot)
+require(stringr)
+
+##load data
+complete_scenario1A <- read.csv("scenarioA_moderate.csv")
+
+##load_and_clean function to concatenate age categories
+load_and_clean<- function(data, r0val){
+  complete_incident_r0val<- data%>%
+    select(time,incid_I1,incid_I2,incid_I3,incid_I4,incid_I5)
+  
+  combined_incident_r0val<- complete_incident_r0val%>%
+        mutate(cat1 = incid_I1) %>%
+        mutate(cat2 = incid_I2) %>%
+        mutate(cat3 = incid_I3) %>% 
+        mutate(cat4 = incid_I4) %>% 
+        mutate(cat5  = incid_I5)
+  
+  combined_incident_r0val<- combined_incident_r0val%>%
+    select(time, cat1, cat2, cat3, cat4, cat5)
+  
+  complete_asymp_r0val<- data %>%
+    dplyr::mutate(tot_1=incid_A1+incid_I1,tot_2=incid_A2+incid_I2,tot_3=incid_A3+incid_I3,tot_4=incid_A4+incid_I4, tot_5=incid_A5+incid_I5) %>%
+    select(time,tot_1,tot_2,tot_3,tot_4,tot_5) 
+  
+    combined_asymp_r0val<- complete_asymp_r0val%>%
+        mutate(cat1 = tot_1)%>%
+        mutate(cat2 = tot_2)%>%
+        mutate(cat3 = tot_3)%>%
+        mutate(cat4 = tot_4)%>%
+        mutate(cat5 = tot_5)
+  
+  combined_asymp_r0val<- combined_asymp_r0val%>%
+    select(time, cat1, cat2, cat3, cat4, cat5)
+  
+  return(list(combined_incident_r0val,combined_asymp_r0val))
+}
+
+combined_incident_A<- load_and_clean(complete_scenario1A,A)[[1]]  
+
+#to get incident asymptomatic + symptomatic cases
+combined_incident_asymp_A<- load_and_clean(complete_scenario1A,A)[[2]]  
+```
+
+
+```{r, message=FALSE, warning=FALSE, echo=FALSE}
+#Here we create a probability matrix of working probabilities from the literature for the probability of becoming a hospitalized case, getting admitted to ICU, needing a ventilator and death. These are nested conditional probabilities that rely on the following assumptions:
+#The percentage of hospitalized cases in each category is obtained from the [CDC](https://www.cdc.gov/mmwr/volumes/69/wr/mm6912e2.htm#T1_down) where we combined the 55-74 age groups and the 75-80 and 80+ age groups.
+#We assume the remainder of the nested probabilities from the [CDC](https://www.cdc.gov/mmwr/volumes/69/wr/mm6912e2.htm#T1_down) and in each subsequent state (hospitalization to ICU, ICU to death) we shift the denominator to be the preceding state's total (e.g. the probability of getting admitted to the ICU is the number of ICU cases for the age group/number of hospitalized cases for the age group).
+#We assume a global probability that 25% of cases admitted to the ICU require a ventilator per [WHO reports](https://www.who.int/publications-detail/report-of-the-who-china-joint-mission-on-coronavirus-disease-2019-(covid-19)).  
+#We assume healthcare workers and the homeless population follow a similar nested probability scheme as those in the 45-54 year age group.
+#Note that this function takes the raw numbers of people in each disease state and converts it to a probability. 
+#importantly, if you look at your final probability matrix and you have a value that is strictly less than 0 or striclty greater than 1 you have made a mistake in entering your data!!
+#each num_diseaseState vector is an arugement of this function, these vectors should be numeric vectors of length 7 (for the seven age groups) and each value should correspond to the raw numbers of people in each disease state observed for each particular age group. 
+#also note that if you divide by 0, you will get NaN (not a number) as an entry, if that just means that 0 percent are in that disease state for age categories, you can manually replace NaN with 0. 
+make_prob_matrix<- function(num_symptomatic,num_severe, num_hospitalized, num_ICU, num_deadFromICU,num_vent, num_deadFromVent){
+prob_severe<- num_severe/num_symptomatic
+prob_hospitalized<- num_hospitalized/num_severe
+prob_ICU<- num_ICU/num_hospitalized
+prob_dead_from_icu<-num_deadFromICU/num_ICU
+prob_vent_icu<- num_vent/num_ICU
+prob_dead_from_vent<- num_deadFromVent/num_vent
+prob_matrix<- cbind(prob_severe,prob_hospitalized,prob_ICU,prob_dead_from_icu,
+                     prob_vent_icu,prob_dead_from_vent)
+return(prob_matrix)
+}
+#cdc inputs (4% death)
+symptomatic_4<- c(123,705,429,838,354)
+hosp_4<- c(3.08,146.64,121.41,307.05,224.5)
+ICU_4<-c(0,29.61,44.62,124.94,106.86)
+dead_ICU_4<- c(0, 1.16,2.93,22.19,32.86)
+vent_4<- c(0,1,2.5,22.01,51)
+dead_vent_4<- c(0,0.25,0.5,9,28.5)
+prob_matrix_4<- make_prob_matrix(symptomatic_4,hosp_4,hosp_4,ICU_4,dead_ICU_4,vent_4,dead_vent_4)
+prob_matrix_4[1,c(4,5,6)]<- c(0,0,0)
+
+#define number of days simulations run for
+n_days <- 299 #number of days minus 1
+sims <- 10
+start_date <- "2020-03-01"
+end_date <- "2020-08-02"
+prob_matrix <- prob_matrix_4
+  
+
+```
+
+
+```{r, message=FALSE, echo=FALSE, warning=FALSE}
+
+##### Estimate number of hospitalizations, ICU admissions, ventilators used, and deaths
+incident_classifications<- function(data, complete_data, R0val, prob_matrix){
+  counts_array_R0val<- array(NA, dim=c(nrow(data),ncol(data),5))
+  counts_array_R0val[,1,]<- data$time
+  
+for(i in 2:ncol(data)){
+  for(r in 1:sims){
+  for(j in 1:n_days){
+    if(data[which(complete_data$time==j & complete_data$run_index==r),i,1]==0){
+      counts_array_R0val[which(complete_data$time==j&complete_data$run_index==r),i,1]<-0
+    }
+    else if(j<=4){
+counts_array_R0val[which(complete_data$time==j&complete_data$run_index==r),i,1]<- 
+      sum(rbinom(data[which(complete_data$time==j&complete_data$run_index==r),i,1],1,prob_matrix[i-1,1]))
+}
+  else{
+    counts_array_R0val[which(complete_data$time==j&complete_data$run_index==r),i,1]<- 
+      sum(rbinom(data[which(complete_data$time==(j-4)&complete_data$run_index==r),i,1],1,prob_matrix[i-1,1]))
+  }
+  }
+  for(n in 1:n_days){
+  if(counts_array_R0val[which(complete_data$time==n&complete_data$run_index==r),i,1]==0){
+    counts_array_R0val[which(complete_data$time==n&complete_data$run_index==r),i,2]<-0
+  }
+    else{
+ counts_array_R0val[which(complete_data$time==n&complete_data$run_index==r),i,2]<- sum(rbinom(counts_array_R0val[which(complete_data$time==n&complete_data$run_index==r),i,1],1,prob_matrix[i-1,2]))
+    }
+  }
+for(k in 1:n_days){
+  if(counts_array_R0val[which(complete_data$time==k&complete_data$run_index==r),i,2]==0){
+    counts_array_R0val[which(complete_data$time==k&complete_data$run_index==r),i,3]<-0
+  }
+    else if(k<=4){      
+counts_array_R0val[which(complete_data$time==k&complete_data$run_index==r),i,3]<- 
+      sum(rbinom(counts_array_R0val[which(complete_data$time==k&complete_data$run_index==r),i,2],1,prob_matrix[i-1,3]))
+     }
+ 
+  else {
+   counts_array_R0val[which(complete_data$time==k&complete_data$run_index==r),i,3]<- 
+      sum(rbinom(counts_array_R0val[which(complete_data$time==(k-4)&complete_data$run_index==r),i,2],1,prob_matrix[i-1,3])) 
+  }
+  
+}
+ 
+ for(l in 1:n_days){
+   if(counts_array_R0val[which(complete_data$time==l&complete_data$run_index==r),i,3]==0){
+     counts_array_R0val[which(complete_data$time==l&complete_data$run_index==r),i,4]<-0
+   }
+       else if(l<=3){
+counts_array_R0val[which(complete_data$time==l&complete_data$run_index==r),i,4]<- 
+      sum(rbinom(counts_array_R0val[which(complete_data$time==(l)&complete_data$run_index==r),i,3],1,prob_matrix[i-1,5])) 
+        }
+   else{
+     counts_array_R0val[which(complete_data$time==l&complete_data$run_index==r),i,4]<- 
+      sum(rbinom(counts_array_R0val[which(complete_data$time==(l-3)&complete_data$run_index==r),i,3],1,prob_matrix[i-1,5])) 
+   }
+ }
+ 
+ for(m in 1:n_days){
+   if(m<=5){
+     counts_array_R0val[which(complete_data$time==m&complete_data$run_index==r),i,5]<- 
+      sum(rbinom(counts_array_R0val[which(complete_data$time==(m)&complete_data$run_index==r),i,3],1,prob_matrix[i-1,4]))+sum(rbinom(counts_array_R0val[which(complete_data$time==(m)&complete_data$run_index==r),i,4],1,prob_matrix[i-1,6]))
+   }
+   
+ else if(m>5&m<=8){
+   counts_array_R0val[which(complete_data$time==m&complete_data$run_index==r),i,5]<- 
+      sum(rbinom(counts_array_R0val[which(complete_data$time==(m)&complete_data$run_index==r),i,3],1,prob_matrix[i-1,4]))+sum(rbinom(counts_array_R0val[which(complete_data$time==(m-5)&complete_data$run_index==r),i,4],1,prob_matrix[i-1,6]))
+ }
+ else{
+   counts_array_R0val[which(complete_data$time==m&complete_data$run_index==r),i,5]<- 
+      sum(rbinom(counts_array_R0val[which(complete_data$time==(m-8)&complete_data$run_index==r),i,3],1,prob_matrix[i-1,4]))+sum(rbinom(counts_array_R0val[which(complete_data$time==(m-5)&complete_data$run_index==r),i,4],1,prob_matrix[i-1,6]))
+ }
+ }
+  }
+}
+return(counts_array_R0val)
+}
+
+counts_array_A<- incident_classifications(combined_incident_A,complete_scenario1A,A,prob_matrix)
+
+counts_array_asymp_A<- incident_classifications(combined_incident_asymp_A,complete_scenario1A,A,prob_matrix)
+
+
+```
+
+
+```{r,message=FALSE, warning=FALSE, echo=FALSE}
+
+##define the point estimates of how long people stay in each of the state   
+##cumulative_counts function
+cumulative_counts<- function(data, complete_data, R0val){
+  cumulative_array_R0val<- array(NA, dim=dim(data))
+  
+  cumulative_array_R0val[,1,]<- data[,1,]
+  for(j in 2:dim(cumulative_array_R0val)[2]){
+    cumulative_array_R0val[which(cumulative_array_R0val[,1,1]==1),j,]<-
+      data[which(data[,1,1]==1),j,]
+   
+    for(i in 2:n_days){
+      
+      cumulative_array_R0val[which(cumulative_array_R0val[,1,1]==i),j,1]<-
+        cumulative_array_R0val[which(cumulative_array_R0val[,1,1]==(i-1)),j,1]+
+        data[which(data[,1,1]==i),j,1]
+      cumulative_array_R0val[which(cumulative_array_R0val[,1,1]==i),j,5]<-
+        cumulative_array_R0val[which(cumulative_array_R0val[,1,1]==(i-1)),j,5]+
+        data[which(data[,1,1]==i),j,5]
+    }
+  for(n in 1:sims){
+     length_of_stay<- c(NA,rtpois(1,12,8,18),rtpois(1,8,4,12),rtpois(1,11,7,17),NA)
+    for(k in 2:n_days+1){
+      if(k<=length_of_stay[2]){
+      cumulative_array_R0val[which(cumulative_array_R0val[,1,1]==k&complete_data$run_index==n),j,2]<-
+        cumulative_array_R0val[which(cumulative_array_R0val[,1,1]==(k-1)&complete_data$run_index==n),j,2]+
+        data[which(data[,1,1]==k&complete_data$run_index==n),j,2]
+      }
+      else {
+        cumulative_array_R0val[which(cumulative_array_R0val[,1,1]==k&complete_data$run_index==n),j,2]<-
+          cumulative_array_R0val[which(cumulative_array_R0val[,1,1]==k-1&complete_data$run_index==n),j,2]+
+          data[which(data[,1,1]==k&complete_data$run_index==n),j,2]-data[which(data[,1,1]==(k-length_of_stay[2])&complete_data$run_index==n),j,2]
+      }
+     }
+    }
+ 
+    for(p in 1:sims){
+    length_of_stay<- c(NA,rtpois(1,12,8,18),rtpois(1,8,4,12),rtpois(1,11,7,17),NA)
+    for(l in 2:n_days+1){
+     
+      if(l <= length_of_stay[3]){
+        cumulative_array_R0val[which(cumulative_array_R0val[,1,1]==l&complete_data$run_index==p),j,3]<-
+          cumulative_array_R0val[which(cumulative_array_R0val[,1,1]==(l-1)&complete_data$run_index==p),j,3]+
+          data[which(data[,1,1]==l&complete_data$run_index==p),j,3]
+      }
+    else{
+      cumulative_array_R0val[which(cumulative_array_R0val[,1,1]==l&complete_data$run_index==p),j,3]<-
+        cumulative_array_R0val[which(cumulative_array_R0val[,1,1]==(l-1)&complete_data$run_index==p),j,3]+
+          data[which(data[,1,1]==l&complete_data$run_index==p),j,3]-data[which(data[,1,1]==(l-length_of_stay[3])&complete_data$run_index==p),j,3]
+    }
+   }
+    }
+     for(q in 1:sims){ 
+       length_of_stay<- c(NA,rtpois(1,12,8,18),rtpois(1,8,4,12),rtpois(1,11,7,17),NA)
+    for(m in 2:n_days+1){
+    
+    if(m<=length_of_stay[4]){
+      cumulative_array_R0val[which(cumulative_array_R0val[,1,1]==m&complete_data$run_index==q),j,4]<-
+        cumulative_array_R0val[which(cumulative_array_R0val[,1,1]==(m-1)&complete_data$run_index==q),j,4]+
+        data[which(data[,1,1]==m&complete_data$run_index==q),j,4]
+    }
+    else{
+      cumulative_array_R0val[which(cumulative_array_R0val[,1,1]==m&complete_data$run_index==q),j,4]<-
+        cumulative_array_R0val[which(cumulative_array_R0val[,1,1]==(m-1)&complete_data$run_index==q),j,4]+
+          data[which(data[,1,1]==m&complete_data$run_index==q),j,4]-data[which(data[,1,1]==(m-length_of_stay[4])&complete_data$run_index==q),j,4]
+      }
+    }
+   
+    }
+    print(j)
+}
+return(cumulative_array_R0val)
+  
+}
+cumulative_array_A<- cumulative_counts(counts_array_A,complete_scenario1A,A)
+
+cumulative_array_asymp_A<- cumulative_counts(counts_array_asymp_A,complete_scenario1A,A)
+
+
+```
+
+
+```{r, message=FALSE, warning-FALSE, echo=FALSE}
+
+median_incident_symptomatic<- function(data, R0val){
+  median_incident_combined_R0val<- matrix(NA,n_days,ncol(data))
+    for(i in 1:nrow(median_incident_combined_R0val)){
+      median_incident_combined_R0val[i,]<-
+        apply(data[which(data[,1]==i),],2,median)
+    }
+  upper_incident_combined_R0val<- matrix(NA,n_days,ncol(data))
+    for(i in 1:nrow(upper_incident_combined_R0val)){
+      upper_incident_combined_R0val[i,]<-
+        apply(data[which(data[,1]==i),],2,quantile, probs=(0.75), na.rm=TRUE)
+    }
+  
+  lower_incident_combined_R0val<- matrix(NA,n_days,ncol(data))
+    for(i in 1:nrow(lower_incident_combined_R0val)){
+      lower_incident_combined_R0val[i,]<-
+        apply(data[which(data[,1]==i),],2,quantile, probs=(0.25), na.rm=TRUE)
+    }
+  
+  
+  return(list(median_incident_combined_R0val, upper_incident_combined_R0val,
+              lower_incident_combined_R0val))
+  }
+incident_symptomatic_A<- median_incident_symptomatic(combined_incident_A,A)
+median_incident_symptomatic_A<- incident_symptomatic_A[[1]]
+upper_incident_symptomatic_A<- incident_symptomatic_A[[2]]
+lower_incident_symptomatic_A<- incident_symptomatic_A[[3]]
+
+incident_asymptomatic_A<- median_incident_symptomatic(combined_incident_asymp_A,A)
+
+####################################################################
+median_counts_array<- function(data, R0val){
+  median_counts_array<- array(NA, dim=c(n_days,dim(data)[2], dim(data)[3]))
+  
+  for(i in 1:dim(median_counts_array)[3]){
+    for(j in 1:dim(median_counts_array)[1]){
+      median_counts_array[j,,i]<- apply(data[which(data[,1,1]==j),,i],2,median)
+    }
+  }
+ 
+   upper_counts_array<- array(NA, dim=c(n_days,dim(data)[2], dim(data)[3]))
+  
+  for(i in 1:dim(upper_counts_array)[3]){
+    for(j in 1:dim(upper_counts_array)[1]){
+      upper_counts_array[j,,i]<- apply(data[which(data[,1,1]==j),,i],2,quantile, prob=0.75,na.rm=T)
+    }
+  } 
+   
+    lower_counts_array<- array(NA, dim=c(n_days,dim(data)[2], dim(data)[3]))
+  
+  for(i in 1:dim(lower_counts_array)[3]){
+    for(j in 1:dim(lower_counts_array)[1]){
+      lower_counts_array[j,,i]<- apply(data[which(data[,1,1]==j),,i],2,quantile, prob=0.25,na.rm=T)
+    }
+  } 
+    return(list(median_counts_array, upper_counts_array,lower_counts_array))
+}
+
+summary_counts_array_A<- median_counts_array(counts_array_A,A)
+median_counts_array_A<- summary_counts_array_A[[1]]
+upper_counts_array_A<- summary_counts_array_A[[2]]
+lower_counts_array_A<- summary_counts_array_A[[3]]
+
+summary_counts_array_A<- median_counts_array(counts_array_asymp_A,A)
+
+########################################
+median_cumulative_array<- function(data, R0val){
+  median_cumulative_array<- array(NA, dim=c(n_days,dim(data)[2], dim(data)[3]))
+  
+  for(i in 1:dim(median_cumulative_array)[3]){
+    for(j in 1:dim(median_cumulative_array)[1]){
+      median_cumulative_array[j,,i]<- apply(data[which(data[,1,1]==j),,i],2,median,na.rm=T)
+    }
+  }
+ 
+   upper_cumulative_array<- array(NA, dim=c(n_days,dim(data)[2], dim(data)[3]))
+  
+  for(i in 1:dim(upper_cumulative_array)[3]){
+    for(j in 1:dim(upper_cumulative_array)[1]){
+      upper_cumulative_array[j,,i]<- apply(data[which(data[,1,1]==j),,i],2,quantile, prob=0.75,na.rm=T)
+    }
+  } 
+   
+    lower_cumulative_array<- array(NA, dim=c(n_days,dim(data)[2], dim(data)[3]))
+  
+  for(i in 1:dim(lower_cumulative_array)[3]){
+    for(j in 1:dim(lower_cumulative_array)[1]){
+      lower_cumulative_array[j,,i]<- apply(data[which(data[,1,1]==j),,i],2,quantile, prob=0.25,na.rm=T)
+    }
+  } 
+    return(list(median_cumulative_array, upper_cumulative_array,lower_cumulative_array))
+}
+summary_cumulative_array_A<- median_cumulative_array(cumulative_array_A,A)
+median_cumulative_array_A<- summary_cumulative_array_A[[1]]
+upper_cumulative_array_A<- summary_cumulative_array_A[[2]]
+lower_cumulative_array_A<- summary_cumulative_array_A[[3]]
+
+summary_cumulative_asymp_array_A<- median_cumulative_array(cumulative_array_asymp_A,A)
+
+```
+
+ -------------------------------
+
+**Key Questions and Findings** 
+
+*Question 1: When and how big are the peaks of infection, hospitalization, and death?*
+
+*Important considerations:*
+
+```{r, message=FALSE, echo=FALSE, warning=FALSE}
+
+
+```
+
+
+
